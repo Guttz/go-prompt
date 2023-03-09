@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
 
@@ -167,22 +168,37 @@ func (r *Render) renderCompletion(buf *Buffer, completions *CompletionManager) {
 	r.out.SetColor(DefaultColor, DefaultColor, false)
 }
 
+// ClearScreen :: Clears the screen and moves the cursor to home
+func (r *Render) ClearScreen() {
+	r.out.EraseScreen()
+	r.out.CursorGoTo(0, 0)
+}
+
 // Render renders to the console.
-func (r *Render) Render(buffer *Buffer, completion *CompletionManager, lexer *Lexer) {
+func (r *Render) Render(buffer *Buffer, previousText string, completion *CompletionManager, lexer *Lexer) {
 	// In situations where a pseudo tty is allocated (e.g. within a docker container),
 	// window size via TIOCGWINSZ is not immediately available and will result in 0,0 dimensions.
 	if r.col == 0 {
 		return
 	}
 	defer func() { debug.AssertNoError(r.out.Flush()) }()
-	r.move(r.previousCursor, 0)
 
 	line := buffer.Text()
+	traceBackLines := strings.Count(previousText, "\n")
+	if len(line) == 0 {
+		// if the new buffer is empty, then we shouldn't traceback any
+		traceBackLines = 0
+	}
+	debug.Log(fmt.Sprintln(line))
+	debug.Log(fmt.Sprintln(traceBackLines))
+
+	r.move((traceBackLines)*int(r.col)+r.previousCursor, 0)
+
 	prefix := r.getCurrentPrefix()
 	cursor := runewidth.StringWidth(prefix) + runewidth.StringWidth(line)
 
 	// prepare area
-	_, y := r.toPos(cursor)
+	_, y := r.toPos((traceBackLines + int(r.col)) + cursor)
 
 	h := y + 1 + int(completion.max)
 	if h > int(r.row) || completionMargin > int(r.col) {
@@ -192,31 +208,24 @@ func (r *Render) Render(buffer *Buffer, completion *CompletionManager, lexer *Le
 
 	// Rendering
 	r.out.HideCursor()
-	defer r.out.ShowCursor()
 
+	r.out.EraseLine()
+	r.out.EraseDown()
 	r.renderPrefix()
-
-	if lexer.IsEnabled {
-		processed := lexer.Process(line)
-		var s = line
-
-		for _, v := range processed {
-			a := strings.SplitAfter(s, v.Text)
-			s = strings.TrimPrefix(s, a[0])
-
-			r.out.SetColor(v.Color, r.inputBGColor, false)
-			r.out.WriteStr(a[0])
-		}
-	} else {
-		r.out.SetColor(r.inputTextColor, r.inputBGColor, false)
-		r.out.WriteStr(line)
-	}
 
 	r.out.SetColor(DefaultColor, DefaultColor, false)
 
 	r.lineWrap(cursor)
 
-	r.out.EraseDown()
+	if buffer.NewLineCount() > 0 {
+		r.renderMultiline(buffer, lexer)
+	} else {
+		r.renderLine(line, lexer)
+		defer r.out.ShowCursor()
+	}
+
+	r.lineWrap(cursor)
+	r.out.SetColor(DefaultColor, DefaultColor, false)
 
 	cursor = r.backward(cursor, runewidth.StringWidth(line)-buffer.DisplayCursorPosition())
 
@@ -257,10 +266,54 @@ func (r *Render) Render(buffer *Buffer, completion *CompletionManager, lexer *Le
 	r.previousCursor = cursor
 }
 
+func (r *Render) renderLine(line string, lexer *Lexer) {
+	if lexer.IsEnabled {
+		processed := lexer.Process(line)
+		var s = line
+
+		for _, v := range processed {
+			a := strings.SplitAfter(s, v.Text)
+			s = strings.TrimPrefix(s, a[0])
+
+			r.out.SetColor(v.Color, r.inputBGColor, false)
+			r.out.WriteStr(a[0])
+		}
+	} else {
+		r.out.SetColor(r.inputTextColor, r.inputBGColor, false)
+		r.out.WriteStr(line)
+	}
+}
+
+func (r *Render) renderMultiline(buffer *Buffer, lexer *Lexer) {
+	before := buffer.Document().TextBeforeCursor()
+	cursor := ""
+	after := ""
+
+	if len(buffer.Document().TextAfterCursor()) == 0 {
+		cursor = " "
+		after = ""
+	} else {
+		cursor = string(buffer.Text()[buffer.Document().cursorPosition])
+		if cursor == "\n" {
+			cursor = " \n"
+		}
+		after = buffer.Document().TextAfterCursor()[1:]
+	}
+
+	r.out.SetColor(r.inputTextColor, r.inputBGColor, false)
+	r.renderLine(before, lexer)
+
+	r.out.SetDisplayAttributes(r.inputTextColor, r.inputBGColor, DisplayReverse)
+	r.out.WriteRawStr(cursor)
+
+	r.out.SetColor(r.inputTextColor, r.inputBGColor, false)
+	r.renderLine(after, lexer)
+}
+
 // BreakLine to break line.
 func (r *Render) BreakLine(buffer *Buffer, lexer *Lexer) {
 	// Erasing and Render
-	cursor := runewidth.StringWidth(buffer.Document().TextBeforeCursor()) + runewidth.StringWidth(r.getCurrentPrefix())
+	cursor := (buffer.NewLineCount() * int(r.col)) + runewidth.StringWidth(buffer.Document().TextBeforeCursor()) + runewidth.StringWidth(r.getCurrentPrefix())
 	r.clear(cursor)
 
 	r.renderPrefix()
